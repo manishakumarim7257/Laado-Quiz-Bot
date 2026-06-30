@@ -1,19 +1,19 @@
 import os
 import sqlite3
 import json
-import random
 import logging
+import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes, ConversationHandler, CallbackQueryHandler, PollAnswerHandler
 )
 
 # Enable Logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID")) if os.getenv("OWNER_ID") else None
@@ -21,22 +21,15 @@ OWNER_ID = int(os.getenv("OWNER_ID")) if os.getenv("OWNER_ID") else None
 DB_FILE = "quiz_bot.db"
 
 def init_db():
-    """Database tables initialization"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            score INTEGER DEFAULT 0
-        )
-    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS quizzes (
             quiz_id INTEGER PRIMARY KEY AUTOINCREMENT,
             creator_id INTEGER,
             title TEXT,
-            description TEXT
+            description TEXT,
+            timer INTEGER DEFAULT 30
         )
     """)
     cursor.execute("""
@@ -47,238 +40,367 @@ def init_db():
             options TEXT,
             correct_answer TEXT,
             explanation TEXT,
+            pre_message TEXT,
             FOREIGN KEY(quiz_id) REFERENCES quizzes(quiz_id)
         )
     """)
     conn.commit()
     conn.close()
 
-# Initialize DB on Startup
 init_db()
 
-# States for Creation & Playing Flow
-(
-    CREATE_TITLE, CREATE_DESC, ADD_QUESTION, 
-    ADD_OPTIONS, ADD_CORRECT, ADD_EXPLANATION
-) = range(6)
-PLAYING_QUIZ = range(6, 7)
+# Global dictionary for active group games memory
+GROUP_GAMES = {}
 
-# --- USER QUIZ CREATION ENGINE ---
-async def create_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "📝 **Naya Quiz Banayein!**\n\nSabse pehle Quiz ka ek badhiya sa **Title** (Naam) likhkar bhejein:",
-        parse_mode="Markdown"
-    )
-    context.user_data["new_quiz"] = {"questions": []}
-    return CREATE_TITLE
+(TITLE, DESCRIPTION, PRE_MSG_OR_Q, QUESTIONS, TIMER) = range(5)
 
-async def create_quiz_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_quiz"]["title"] = update.message.text
-    await update.message.reply_text("👍 Title save ho gaya.\n\nAb is quiz ka ek chhota sa **Description** likhkar bhejein:")
-    return CREATE_DESC
-
-async def create_quiz_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_quiz"]["description"] = update.message.text
-    await update.message.reply_text("✅ Description save ho gaya!\n\nChaliye ab **Saval (Question 1)** likhkar bhejein:")
-    return ADD_QUESTION
-
-async def create_add_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["current_working_q"] = {"text": update.message.text}
-    await update.message.reply_text(
-        "Ab is saval ke **Options** bhejein.\nFormat: Har option ko ek nayi line me likhein (Kam se kam 2, max 4).\n\n"
-        "Example:\nMumbai\nDelhi\nKolkata\nChennai"
-    )
-    return ADD_OPTIONS
-
-async def create_add_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    options = [opt.strip() for opt in update.message.text.split("\n") if opt.strip()]
-    if len(options) < 2:
-        await update.message.reply_text("❌ Kam se kam 2 options dena zaroori hai. Dubara bhejein:")
-        return ADD_OPTIONS
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args and args.startswith("quiz_"):
+        quiz_id = args.split("_")
+        chat_id = update.effective_chat.id
         
-    context.user_data["current_working_q"]["options"] = options
-    keyboard = [[opt] for opt in options]
-    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    
-    await update.message.reply_text("Buttons me se **Sahi Javab (Correct Answer)** par click karein:", reply_markup=reply_markup)
-    return ADD_CORRECT
-
-async def create_add_correct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    selected = update.message.text
-    q_data = context.user_data["current_working_q"]
-    
-    if selected not in q_data["options"]:
-        await update.message.reply_text("❌ Diye gaye options me se hi chunyein. Dubara koshish karein:")
-        return ADD_CORRECT
-        
-    q_data["correct"] = selected
-    await update.message.reply_text(
-        "💡 Is saval ke liye koi **Explanation** likhein.\nAgar nahi likhna chahte toh `/skip` type karein:",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return ADD_EXPLANATION
-
-async def create_add_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    q_data = context.user_data["current_working_q"]
-    q_data["explanation"] = "" if text.lower() == "/skip" else text
-    
-    context.user_data["new_quiz"]["questions"].append(q_data)
-    keyboard = [["➕ Naya Saval Jodein", "💾 Quiz Save Karein"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        f"✅ Saval jud gaya! Ab tak total {len(context.user_data['new_quiz']['questions'])} saval hain.\n\nAap kya karna chahte hain?",
-        reply_markup=reply_markup
-    )
-    return ADD_QUESTION
-
-async def handle_creation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    choice = update.message.text
-    if choice == "➕ Naya Saval Jodein":
-        await update.message.reply_text("Agla **Saval (Question)** likhkar bhejein:", reply_markup=ReplyKeyboardRemove())
-        return ADD_QUESTION
-    elif choice == "💾 Quiz Save Karein":
-        quiz = context.user_data["new_quiz"]
-        if not quiz["questions"]:
-            await update.message.reply_text("❌ Khali quiz save nahi ki ja sakti.")
-            return ADD_QUESTION
-            
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO quizzes (creator_id, title, description) VALUES (?, ?, ?)", (update.message.from_user.id, quiz["title"], quiz["description"]))
-        quiz_id = cursor.lastrowid
-        
-        for q in quiz["questions"]:
-            cursor.execute("INSERT INTO questions (quiz_id, question_text, options, correct_answer, explanation) VALUES (?, ?, ?, ?, ?)", (quiz_id, q["text"], json.dumps(q["options"]), q["correct"], q["explanation"]))
-        conn.commit()
+        cursor.execute("SELECT title, description, timer FROM quizzes WHERE quiz_id = ?", (quiz_id,))
+        quiz_data = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM questions WHERE quiz_id = ?", (quiz_id,))
+        total_q = cursor.fetchone()
         conn.close()
         
-        await update.message.reply_text(f"🎉 **Quiz Save Ho Gaya!**\n\n🆔 **Quiz ID:** `{quiz_id}`\n📚 **Title:** {quiz['title']}\n\nKhelne ke liye `/play_id {quiz_id}` use karein.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-    return await create_add_question(update, context)
-# --- DATABASE QUIZ PLAYING ENGINE ---
-async def play_quiz_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Khelne ke liye Quiz ID chahiye. Example: `/play_id 1`")
+        if not quiz_data:
+            await update.message.reply_text("❌ Quiz data not found.")
+            return
+
+        title, desc, timer = quiz_data
+        time_disp = f"{timer} sec" if timer < 60 else f"{timer // 60} min"
+        
+        init_text = (
+            f"🏁 **Quiz Setup Ready!**\n\n"
+            f"📚 **Title:** {title}\n"
+            f"ℹ️ **Description:** {desc if desc else 'No description'}\n"
+            f"🙋‍♂️ **Questions:** {total_q}\n"
+            f"⏱ **Time per question:** {time_disp}\n\n"
+            "⚠️ *Khelne ke liye kam se kam 2 users ka join karna zaroori hai!*"
+        )
+        
+        keyboard = [[InlineKeyboardButton("Join Quiz ➕", callback_data=f"join_{quiz_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(init_text, reply_markup=reply_markup, parse_mode="Markdown")
         return
-    quiz_id = context.args[0]
+
+    welcome_text = (
+        "👋 **Welcome to Laado Quiz Bot!**\n\n"
+        "🚀 /newquiz - Naya Quiz banana shuru karein\n"
+        "❌ /cancel - Active creation flow cancel karein"
+    )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    async def new_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "Let's create a new quiz. First, send me the title of your quiz (e.g., 'Aptitude Test' or '10 questions about bears').",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    context.user_data["quiz_build"] = {"title": "", "description": "", "questions": []}
+    return TITLE
+
+async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["quiz_build"]["title"] = update.message.text
+    await update.message.reply_text("Good. Now send me a description of your quiz. This is optional, you can /skip this step.")
+    return DESCRIPTION
+
+async def receive_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data["quiz_build"]["description"] = "" if text.lower() == "/skip" else text
+    keyboard = [["➕ Create a Question"]]
+    await update.message.reply_text(
+        f"Good. Your quiz '{context.user_data['quiz_build']['title']}' now has 0 questions. If you made a mistake, send /undo.\n\n"
+        "Now send the next question – or some text or media that will be shown before it.",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return PRE_MSG_OR_Q
+
+async def receive_pre_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    if text == "➕ Create a Question":
+        await update.message.reply_text(
+            "💡 **Sawal jodne ke liye:**\nClick on 📎 (Attachment) -> Select **Poll**.\n"
+            "Enable **Quiz Mode**, add 2-7 options, pick the correct one, and tap Create.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return QUESTIONS
+    context.user_data["temp_pre_msg"] = text
+    await update.message.reply_text(
+        "Great! Now use the button to send me the question related to this message.\nIf sent by mistake, send /undo.",
+        reply_markup=ReplyKeyboardMarkup([["➕ Create a Question"]], resize_keyboard=True)
+    )
+    return PRE_MSG_OR_Q
+
+async def receive_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    poll = update.message.poll
+    if poll.type != "quiz":
+        await update.message.reply_text("❌ Kripya Quiz mode wala poll hi send karein:")
+        return QUESTIONS
+    if len(poll.options) > 7:
+        await update.message.reply_text("❌ Maximum 7 options allowed. Re-send poll:")
+        return QUESTIONS
+
+    opts = [o.text for o in poll.options]
+    q_data = {
+        "text": poll.question, "options": opts, "correct": opts[poll.correct_option_id],
+        "explanation": poll.explanation if poll.explanation else "", "pre_message": context.user_data.get("temp_pre_msg", "")
+    }
+    context.user_data.pop("temp_pre_msg", None)
+    context.user_data["quiz_build"]["questions"].append(q_data)
+    
+    await update.message.reply_text(
+        f"Good. Your quiz now has {len(context.user_data['quiz_build']['questions'])} question(s). Send next question or /done to finish.",
+        reply_markup=ReplyKeyboardMarkup([["➕ Create a Question"]], resize_keyboard=True)
+    )
+    return PRE_MSG_OR_Q
+
+async def handle_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    quiz = context.user_data.get("quiz_build")
+    if quiz and quiz["questions"]:
+        quiz["questions"].pop()
+    await update.message.reply_text("↩️ Last item removed. Send next or /done.", reply_markup=ReplyKeyboardMarkup([["➕ Create a Question"]], resize_keyboard=True))
+    return PRE_MSG_OR_Q
+
+async def finish_quiz_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton("15 sec", callback_data="time_15"), InlineKeyboardButton("30 sec", callback_data="time_30")],
+        [InlineKeyboardButton("1 min", callback_data="time_60"), InlineKeyboardButton("2 min", callback_data="time_120")]
+    ]
+    await update.message.reply_text("Please set a time limit for questions:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return TIMER
+
+async def save_timer_and_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    t_sec = int(query.data.split("_"))
+    quiz = context.user_data["quiz_build"]
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT title, description FROM quizzes WHERE quiz_id = ?", (quiz_id,))
-    quiz_data = cursor.fetchone()
-    
-    if not quiz_data:
-        await update.message.reply_text("❌ Is ID ka koi quiz database me nahi mila.")
-        conn.close()
-        return
-        
-    title, desc = quiz_data
-    cursor.execute("SELECT question_text, options, correct_answer, explanation FROM questions WHERE quiz_id = ?", (quiz_id,))
-    questions_rows = cursor.fetchall()
+    cursor.execute("INSERT INTO quizzes (creator_id, title, description, timer) VALUES (?, ?, ?, ?)", (query.from_user.id, quiz["title"], quiz["description"], t_sec))
+    qid = cursor.lastrowid
+    for q in quiz["questions"]:
+        cursor.execute("INSERT INTO questions (quiz_id, question_text, options, correct_answer, explanation, pre_message) VALUES (?, ?, ?, ?, ?, ?)", 
+                       (qid, q["text"], json.dumps(q["options"]), q["correct"], q["explanation"], q["pre_message"]))
+    conn.commit()
     conn.close()
     
-    if not questions_rows:
-        await update.message.reply_text("❌ Is quiz me koi saval nahi hain.")
-        return
-
-    context.user_data["active_quiz"] = {
-        "title": title,
-        "questions": [{"text": r[0], "options": json.loads(r[1]), "correct": r[2], "explanation": r[3]} for r in questions_rows],
-        "current_index": 0, "score": 0
-    }
-    random.shuffle(context.user_data["active_quiz"]["questions"])
-    
-    await update.message.reply_text(f"🏁 **Quiz Shuru Ho Rahi Hai!**\n\n📝 **Title:** {title}\n💡 **Description:** {desc}", parse_mode="Markdown")
-    return await send_next_db_question(update, context)
-
-async def send_next_db_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    quiz = context.user_data["active_quiz"]
-    idx = quiz["current_index"]
-    if idx >= len(quiz["questions"]):
-        await (update.message or update.callback_query.message).reply_text(
-            f"🎉 **Quiz Complete!**\n\nAapka score: *{quiz['score']}/{len(quiz['questions'])}*", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
-
-    q = quiz["questions"][idx]
-    opts = list(q["options"])
-    random.shuffle(opts)
-    keyboard = [[opt] for opt in opts]
-    
-    msg_text = f"❓ **Question {idx + 1}:**\n{q['text']}"
-    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    
-    if update.message:
-        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await update.callback_query.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-    return PLAYING_QUIZ
-
-async def handle_db_quiz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_ans = update.message.text
-    quiz = context.user_data["active_quiz"]
-    q = quiz["questions"][quiz["current_index"]]
-    
-    if user_ans == q["correct"]:
-        quiz["score"] += 1
-        await update.message.reply_text("✅ **Sahi Javab!**", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"❌ **Galat Javab!**\n\nSahi tha: *{q['correct']}*\n💡 _Explanation:_ {q['explanation']}", parse_mode="Markdown")
-        
-    quiz["current_index"] += 1
-    return await send_next_db_question(update, context)
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Action cancel kar diya gaya hai.", reply_markup=ReplyKeyboardRemove())
+    await show_summary_panel(query, context, qid)
     return ConversationHandler.END
 
-# --- OWNER CONTROL COMMANDS ---
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != OWNER_ID:
-        return
+async def show_summary_panel(query, context, quiz_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    total_quizzes = cursor.execute("SELECT COUNT(*) FROM quizzes").fetchone()[0]
-    total_questions = cursor.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+    cursor.execute("SELECT title, timer FROM quizzes WHERE quiz_id = ?", (quiz_id,))
+    title, timer = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM questions WHERE quiz_id = ?", (quiz_id,))
+    total_q = cursor.fetchone()
     conn.close()
-    await update.message.reply_text(f"📊 **Bot Status Panel**\n\nTotal Created Quizzes: {total_quizzes}\nTotal Questions Stored: {total_questions}", parse_mode="Markdown")
 
-# --- MAIN APP START ENGINE ---
-def main():
-    if not BOT_TOKEN:
-        print("Error: Set BOT_TOKEN inside .env file")
+    time_display = f"{timer} sec" if timer < 60 else f"{timer // 60} min"
+    bot_username = context.bot.username
+    
+    summary_text = (
+        "👍 **Quiz created.**\n\n"
+        "🏁 Hii your quiz:\n"
+        f"📚 *\"{title}\"* Nobody answered\n"
+        f"🙋‍♂️ {total_q} question(s)  ·  ⏱ Time: {time_display}\n\n"
+        f"🔗 **External sharing link:**\n"
+        f"https://t.me{bot_username}?start=quiz_{quiz_id}"
+    )
+    
+    inline_keyboard = [
+        [InlineKeyboardButton("🏁 Start this quiz", callback_data=f"start_{quiz_id}")],
+        [InlineKeyboardButton("👥 Start quiz in group", url=f"https://t.me{bot_username}?startgroup=quiz_{quiz_id}")],
+        [InlineKeyboardButton("📢 Share quiz", url=f"https://t.meshare/url?url=https://t.me{bot_username}?start=quiz_{quiz_id}")],
+        [InlineKeyboardButton("⚙️ Edit quiz", callback_data=f"edit_{quiz_id}"), InlineKeyboardButton("📊 Quiz status", callback_data=f"status_{quiz_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(inline_keyboard)
+    await query.message.reply_text(summary_text, reply_markup=reply_markup, parse_mode="Markdown")
+    async def edit_quiz_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = query.data.split("_")
+    
+    keyboard = [
+        [InlineKeyboardButton("📝 Edit title", callback_data=f"edtitle_{quiz_id}")],
+        [InlineKeyboardButton("ℹ️ Edit description", callback_data=f"eddesc_{quiz_id}")],
+        [InlineKeyboardButton("❓ Edit question", callback_data=f"edquest_{quiz_id}")],
+        [InlineKeyboardButton("⏱ Edit timer settings", callback_data=f"edtime_{quiz_id}")],
+        [InlineKeyboardButton("Back 🔙", callback_data=f"backto_{quiz_id}")]
+    ]
+    await query.edit_message_text(
+        text="⚙️ **Edit Quiz Menu**\n\nAap is quiz ka kya badalna chahte hain? Niche se chunyein:",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+    )
+
+async def back_to_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = query.data.split("_")
+    await query.message.delete()
+    await show_summary_panel(query, context, quiz_id)
+
+async def handle_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+    user_name = query.from_user.username if query.from_user.username else query.from_user.first_name
+    quiz_id = query.data.split("_")
+    
+    if chat_id not in GROUP_GAMES:
+        GROUP_GAMES[chat_id] = {"quiz_id": quiz_id, "joined_users": {}, "current_q": 0, "scores": {}, "poll_map": {}, "start_time": None}
+        
+    game = GROUP_GAMES[chat_id]
+    game["joined_users"][user_id] = f"@{user_name}" if query.from_user.username else user_name
+    game["scores"][user_id] = {"score": 0, "total_time": 0.0}
+    
+    joined_count = len(game["joined_users"])
+    names_list = ", ".join(game["joined_users"].values())
+    
+    keyboard = [[InlineKeyboardButton("Join Quiz ➕", callback_data=f"join_{quiz_id}")]]
+    if joined_count >= 2:
+        keyboard.append([InlineKeyboardButton("Start Quiz 🚀", callback_data=f"run_{quiz_id}")])
+        
+    await query.edit_message_text(
+        text=f"🏁 **Quiz Setup Active**\n\nJoined Users ({joined_count}): {names_list}\n\n*Minimum 2 users criteria met. You can start the quiz now.*",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    await query.answer(text="Aapne quiz successfully join kar li!")
+
+async def launch_group_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    game = GROUP_GAMES.get(chat_id)
+    
+    if not game or len(game["joined_users"]) < 2:
+        await query.answer("❌ Error: Minimum 2 users zaroori hain!", show_alert=True)
+        return
+        
+    await query.answer()
+    await query.message.reply_text("🔥 Get ready! Quiz shuru ho rahi hai...")
+    await asyncio.sleep(2)
+    
+    game["current_q"] = 0
+    await send_next_group_poll(chat_id, context)
+
+async def send_next_group_poll(chat_id, context):
+    game = GROUP_GAMES[chat_id]
+    qid = game["quiz_id"]
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT timer FROM quizzes WHERE quiz_id = ?", (qid,))
+    timer = cursor.fetchone()
+    cursor.execute("SELECT question_text, options, correct_answer, pre_message, explanation FROM questions WHERE quiz_id = ?", (qid,))
+    questions = cursor.fetchall()
+    conn.close()
+    
+    if game["current_q"] >= len(questions):
+        await compile_group_leaderboard(chat_id, context)
         return
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    q = questions[game["current_q"]]
+    q_text, options_json, correct_ans, pre_msg, explanation = q
+    options = json.loads(options_json)
+    correct_idx = options.index(correct_ans)
+    
+    if pre_msg:
+        await context.bot.send_message(chat_id=chat_id, text=f"📢 *Context:* {pre_msg}", parse_mode="Markdown")
+        await asyncio.sleep(1)
 
-    create_handler = ConversationHandler(
-        entry_points=[CommandHandler("create", create_quiz_start)],
+    game["start_time"] = datetime.now()
+    poll_msg = await context.bot.send_poll(
+        chat_id=chat_id, question=f"❓ Q ({game['current_q'] + 1}/{len(questions)}): {q_text}",
+        options=options, type="quiz", correct_option_id=correct_idx,
+        explanation=explanation if explanation else None, is_anonymous=False
+    )
+    
+    game["poll_map"][poll_msg.poll.id] = {"correct_idx": correct_idx, "chat_id": chat_id}
+    
+    await asyncio.sleep(timer)
+    game["current_q"] += 1
+    await send_next_group_poll(chat_id, context)
+
+async def track_poll_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.poll_answer
+    pid = ans.poll_id
+    uid = ans.user.id
+    
+    for cid, game in list(GROUP_GAMES.items()):
+        if pid in game["poll_map"]:
+            c_idx = game["poll_map"][pid]["correct_idx"]
+            if uid in game["scores"] and ans.option_ids:
+                chosen = ans.option_ids
+                if chosen == c_idx:
+                    elapsed = (datetime.now() - game["start_time"]).total_seconds()
+                    game["scores"][uid]["score"] += 1
+                    game["scores"][uid]["total_time"] += elapsed
+
+async def compile_group_leaderboard(chat_id, context):
+    game = GROUP_GAMES.get(chat_id)
+    if not game: return
+    
+    sorted_scores = sorted(game["scores"].items(), key=lambda x: (x["score"], -x["total_time"]), reverse=True)[:20]
+    board = "🏆 **FINAL QUIZ LEADERBOARD (Top 20)** 🏆\n\n"
+    
+    if not sorted_scores or len(game["joined_users"]) == 0:
+        board += "Nobody answered or participated in this quiz. 🤷‍♂️"
+        kb = []
+    else:
+        for idx, (uid, meta) in enumerate(sorted_scores, 1):
+            user_obj = game["joined_users"].get(uid, "User")
+            score = meta["score"]
+            total_time = round(meta["total_time"], 1)
+            
+            if idx == 1: medal = "🥇"
+            elif idx == 2: medal = "🥈"
+            elif idx == 3: medal = "🥉"
+            else: medal = f"{idx}."
+                
+            board += f"{medal} {user_obj} — ⭐ *{score}* Sahi (⏱ {total_time} sec)\n"
+            
+        share_text = f"Maine Laado Quiz Bot me participate kiya aur top players me rank banayi! 🔥"
+        kb = [[InlineKeyboardButton("📢 Share Score / Results", url=f"https://t.me{share_text}")]]
+        
+    await context.bot.send_message(chat_id=chat_id, text=board, reply_markup=InlineKeyboardMarkup(kb) if kb else None, parse_mode="Markdown")
+    GROUP_GAMES.pop(chat_id, None)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Setup cancelled.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+def main():
+    if not BOT_TOKEN: return
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    new_quiz_handler = ConversationHandler(
+        entry_points=[CommandHandler("newquiz", new_quiz_start)],
         states={
-            CREATE_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_quiz_title)],
-            CREATE_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_quiz_desc)],
-            ADD_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_creation_choice)],
-            ADD_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_add_options)],
-            ADD_CORRECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_add_correct)],
-            ADD_EXPLANATION: [MessageHandler(filters.TEXT, create_add_explanation)],
+            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
+            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_desc), CommandHandler("skip", receive_desc)],
+            PRE_MSG_OR_Q: [CommandHandler("undo", handle_undo), CommandHandler("done", finish_quiz_creation), MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pre_msg)],
+            QUESTIONS: [CommandHandler("undo", handle_undo), CommandHandler("done", finish_quiz_creation), MessageHandler(filters.POLL, receive_poll)],
+            TIMER: [CallbackQueryHandler(save_timer_and_finalize, pattern="^time_")]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
-    play_handler = ConversationHandler(
-        entry_points=[CommandHandler("play_id", play_quiz_by_id)],
-        states={PLAYING_QUIZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_db_quiz_answer)]},
-        fallbacks=[CommandHandler("cancel", cancel)]
-    )
-
-    application.add_handler(create_handler)
-    application.add_handler(play_handler)
-    application.add_handler(CommandHandler("stats", stats))
-
-    print("🚀 Advanced SQLite Quiz Bot is active...")
-    application.run_polling()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(new_quiz_handler)
+    app.add_handler(CallbackQueryHandler(handle_group_join, pattern="^join_"))
+    app.add_handler(CallbackQueryHandler(launch_group_quiz, pattern="^run_"))
+    app.add_handler(CallbackQueryHandler(edit_quiz_menu, pattern="^edit_"))
+    app.add_handler(CallbackQueryHandler(back_to_summary, pattern="^backto_"))
+    app.add_handler(PollAnswerHandler(track_poll_answers))
+    
+    print("🚀 Advanced Telegram Quiz-Bot UI Active...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
-  
+    
