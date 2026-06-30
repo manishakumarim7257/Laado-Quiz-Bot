@@ -54,10 +54,18 @@ GROUP_GAMES = {}
 
 (TITLE, DESCRIPTION, PRE_MSG_OR_Q, QUESTIONS, TIMER) = range(5)
 
+async def new_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "Let's create a new quiz. First, send me the title of your quiz (e.g., 'Aptitude Test' or '10 questions about bears').",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    context.user_data["quiz_build"] = {"title": "", "description": "", "questions": []}
+    return TITLE
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
-    if args and args.startswith("quiz_"):
-        quiz_id = args.split("_")
+    if args and len(args) > 0 and args[0].startswith("quiz_"):
+        quiz_id = args[0].split("_")[1]
         chat_id = update.effective_chat.id
         
         conn = sqlite3.connect(DB_FILE)
@@ -79,7 +87,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏁 **Quiz Setup Ready!**\n\n"
             f"📚 **Title:** {title}\n"
             f"ℹ️ **Description:** {desc if desc else 'No description'}\n"
-            f"🙋‍♂️ **Questions:** {total_q}\n"
+            f"🙋‍♂️ **Questions:** {total_q[0]}\n"
             f"⏱ **Time per question:** {time_disp}\n\n"
             "⚠️ *Khelne ke liye kam se kam 2 users ka join karna zaroori hai!*"
         )
@@ -95,13 +103,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❌ /cancel - Active creation flow cancel karein"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
-    async def new_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "Let's create a new quiz. First, send me the title of your quiz (e.g., 'Aptitude Test' or '10 questions about bears').",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    context.user_data["quiz_build"] = {"title": "", "description": "", "questions": []}
-    return TITLE
 
 async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["quiz_build"]["title"] = update.message.text
@@ -176,7 +177,7 @@ async def finish_quiz_creation(update: Update, context: ContextTypes.DEFAULT_TYP
 async def save_timer_and_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    t_sec = int(query.data.split("_"))
+    t_sec = int(query.data.split("_")[1])
     quiz = context.user_data["quiz_build"]
     
     conn = sqlite3.connect(DB_FILE)
@@ -206,25 +207,26 @@ async def show_summary_panel(query, context, quiz_id):
     
     summary_text = (
         "👍 **Quiz created.**\n\n"
-        "🏁 Hii your quiz:\n"
-        f"📚 *\"{title}\"* Nobody answered\n"
-        f"🙋‍♂️ {total_q} question(s)  ·  ⏱ Time: {time_display}\n\n"
+        "🏁 Here's your quiz:\n"
+        f"📚 *\"{title}\"*\n"
+        f"🙋‍♂️ {total_q[0]} question(s)  ·  ⏱ Time: {time_display}\n\n"
         f"🔗 **External sharing link:**\n"
-        f"https://t.me{bot_username}?start=quiz_{quiz_id}"
+        f"https://t.me/{bot_username}?start=quiz_{quiz_id}"
     )
     
     inline_keyboard = [
         [InlineKeyboardButton("🏁 Start this quiz", callback_data=f"start_{quiz_id}")],
-        [InlineKeyboardButton("👥 Start quiz in group", url=f"https://t.me{bot_username}?startgroup=quiz_{quiz_id}")],
-        [InlineKeyboardButton("📢 Share quiz", url=f"https://t.meshare/url?url=https://t.me{bot_username}?start=quiz_{quiz_id}")],
+        [InlineKeyboardButton("👥 Start quiz in group", url=f"https://t.me/{bot_username}?startgroup=quiz_{quiz_id}")],
+        [InlineKeyboardButton("📢 Share quiz", url=f"https://t.me/share/url?url=https://t.me/{bot_username}?start=quiz_{quiz_id}")],
         [InlineKeyboardButton("⚙️ Edit quiz", callback_data=f"edit_{quiz_id}"), InlineKeyboardButton("📊 Quiz status", callback_data=f"status_{quiz_id}")]
     ]
     reply_markup = InlineKeyboardMarkup(inline_keyboard)
     await query.message.reply_text(summary_text, reply_markup=reply_markup, parse_mode="Markdown")
-    async def edit_quiz_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def edit_quiz_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    quiz_id = query.data.split("_")
+    quiz_id = query.data.split("_")[1]
     
     keyboard = [
         [InlineKeyboardButton("📝 Edit title", callback_data=f"edtitle_{quiz_id}")],
@@ -241,7 +243,7 @@ async def show_summary_panel(query, context, quiz_id):
 async def back_to_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    quiz_id = query.data.split("_")
+    quiz_id = query.data.split("_")[1]
     await query.message.delete()
     await show_summary_panel(query, context, quiz_id)
 
@@ -250,7 +252,7 @@ async def handle_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     user_id = query.from_user.id
     user_name = query.from_user.username if query.from_user.username else query.from_user.first_name
-    quiz_id = query.data.split("_")
+    quiz_id = query.data.split("_")[1]
     
     if chat_id not in GROUP_GAMES:
         GROUP_GAMES[chat_id] = {"quiz_id": quiz_id, "joined_users": {}, "current_q": 0, "scores": {}, "poll_map": {}, "start_time": None}
@@ -295,7 +297,8 @@ async def send_next_group_poll(chat_id, context):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT timer FROM quizzes WHERE quiz_id = ?", (qid,))
-    timer = cursor.fetchone()
+    timer_result = cursor.fetchone()
+    timer = timer_result[0] if timer_result else 30
     cursor.execute("SELECT question_text, options, correct_answer, pre_message, explanation FROM questions WHERE quiz_id = ?", (qid,))
     questions = cursor.fetchall()
     conn.close()
@@ -336,7 +339,7 @@ async def track_poll_answers(update: Update, context: ContextTypes.DEFAULT_TYPE)
             c_idx = game["poll_map"][pid]["correct_idx"]
             if uid in game["scores"] and ans.option_ids:
                 chosen = ans.option_ids
-                if chosen == c_idx:
+                if chosen == [c_idx]:
                     elapsed = (datetime.now() - game["start_time"]).total_seconds()
                     game["scores"][uid]["score"] += 1
                     game["scores"][uid]["total_time"] += elapsed
@@ -345,7 +348,7 @@ async def compile_group_leaderboard(chat_id, context):
     game = GROUP_GAMES.get(chat_id)
     if not game: return
     
-    sorted_scores = sorted(game["scores"].items(), key=lambda x: (x["score"], -x["total_time"]), reverse=True)[:20]
+    sorted_scores = sorted(game["scores"].items(), key=lambda x: (-x[1]["score"], x[1]["total_time"]))[:20]
     board = "🏆 **FINAL QUIZ LEADERBOARD (Top 20)** 🏆\n\n"
     
     if not sorted_scores or len(game["joined_users"]) == 0:
@@ -365,7 +368,7 @@ async def compile_group_leaderboard(chat_id, context):
             board += f"{medal} {user_obj} — ⭐ *{score}* Sahi (⏱ {total_time} sec)\n"
             
         share_text = f"Maine Laado Quiz Bot me participate kiya aur top players me rank banayi! 🔥"
-        kb = [[InlineKeyboardButton("📢 Share Score / Results", url=f"https://t.me{share_text}")]]
+        kb = [[InlineKeyboardButton("📢 Share Score / Results", url=f"https://t.me/share/url?url={share_text}")]]
         
     await context.bot.send_message(chat_id=chat_id, text=board, reply_markup=InlineKeyboardMarkup(kb) if kb else None, parse_mode="Markdown")
     GROUP_GAMES.pop(chat_id, None)
@@ -403,4 +406,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
