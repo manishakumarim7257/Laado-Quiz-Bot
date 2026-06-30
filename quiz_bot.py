@@ -171,8 +171,32 @@ async def finish_quiz_creation(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("15 sec", callback_data="time_15"), InlineKeyboardButton("30 sec", callback_data="time_30")],
         [InlineKeyboardButton("1 min", callback_data="time_60"), InlineKeyboardButton("2 min", callback_data="time_120")]
     ]
-    await update.message.reply_text("Please set a time limit for questions:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("⏱️ **Please set a time limit for questions:**\n\nOr type: 15, 30, 60, 120", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     return TIMER
+
+async def handle_timer_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    time_map = {"15": 15, "30": 30, "60": 60, "120": 120}
+    
+    if text not in time_map:
+        await update.message.reply_text("❌ Invalid time. Please enter: 15, 30, 60, or 120")
+        return TIMER
+    
+    t_sec = time_map[text]
+    quiz = context.user_data["quiz_build"]
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO quizzes (creator_id, title, description, timer) VALUES (?, ?, ?, ?)", (update.message.from_user.id, quiz["title"], quiz["description"], t_sec))
+    qid = cursor.lastrowid
+    for q in quiz["questions"]:
+        cursor.execute("INSERT INTO questions (quiz_id, question_text, options, correct_answer, explanation, pre_message) VALUES (?, ?, ?, ?, ?, ?)", 
+                       (qid, q["text"], json.dumps(q["options"]), q["correct"], q["explanation"], q["pre_message"]))
+    conn.commit()
+    conn.close()
+    
+    await show_summary_panel_text(update, context, qid)
+    return ConversationHandler.END
 
 async def save_timer_and_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -222,6 +246,36 @@ async def show_summary_panel(query, context, quiz_id):
     ]
     reply_markup = InlineKeyboardMarkup(inline_keyboard)
     await query.message.reply_text(summary_text, reply_markup=reply_markup, parse_mode="Markdown")
+
+async def show_summary_panel_text(update, context, quiz_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT title, timer FROM quizzes WHERE quiz_id = ?", (quiz_id,))
+    title, timer = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM questions WHERE quiz_id = ?", (quiz_id,))
+    total_q = cursor.fetchone()
+    conn.close()
+
+    time_display = f"{timer} sec" if timer < 60 else f"{timer // 60} min"
+    bot_username = context.bot.username
+    
+    summary_text = (
+        "👍 **Quiz created.**\n\n"
+        "🏁 Here's your quiz:\n"
+        f"📚 *\"{title}\"*\n"
+        f"🙋‍♂️ {total_q[0]} question(s)  ·  ⏱ Time: {time_display}\n\n"
+        f"🔗 **External sharing link:**\n"
+        f"https://t.me/{bot_username}?start=quiz_{quiz_id}"
+    )
+    
+    inline_keyboard = [
+        [InlineKeyboardButton("🏁 Start this quiz", callback_data=f"start_{quiz_id}")],
+        [InlineKeyboardButton("👥 Start quiz in group", url=f"https://t.me/{bot_username}?startgroup=quiz_{quiz_id}")],
+        [InlineKeyboardButton("📢 Share quiz", url=f"https://t.me/share/url?url=https://t.me/{bot_username}?start=quiz_{quiz_id}")],
+        [InlineKeyboardButton("⚙️ Edit quiz", callback_data=f"edit_{quiz_id}"), InlineKeyboardButton("📊 Quiz status", callback_data=f"status_{quiz_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(inline_keyboard)
+    await update.message.reply_text(summary_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def edit_quiz_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -297,8 +351,7 @@ async def send_next_group_poll(chat_id, context):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT timer FROM quizzes WHERE quiz_id = ?", (qid,))
-    timer_result = cursor.fetchone()
-    timer = timer_result[0] if timer_result else 30
+    timer = cursor.fetchone()
     cursor.execute("SELECT question_text, options, correct_answer, pre_message, explanation FROM questions WHERE quiz_id = ?", (qid,))
     questions = cursor.fetchall()
     conn.close()
@@ -325,7 +378,7 @@ async def send_next_group_poll(chat_id, context):
     
     game["poll_map"][poll_msg.poll.id] = {"correct_idx": correct_idx, "chat_id": chat_id}
     
-    await asyncio.sleep(timer)
+    await asyncio.sleep(timer[0])
     game["current_q"] += 1
     await send_next_group_poll(chat_id, context)
 
@@ -348,7 +401,7 @@ async def compile_group_leaderboard(chat_id, context):
     game = GROUP_GAMES.get(chat_id)
     if not game: return
     
-    sorted_scores = sorted(game["scores"].items(), key=lambda x: (-x[1]["score"], x[1]["total_time"]))[:20]
+    sorted_scores = sorted(game["scores"].items(), key=lambda x: (x["score"], -x["total_time"]), reverse=True)[:20]
     board = "🏆 **FINAL QUIZ LEADERBOARD (Top 20)** 🏆\n\n"
     
     if not sorted_scores or len(game["joined_users"]) == 0:
@@ -388,7 +441,10 @@ def main():
             DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_desc), CommandHandler("skip", receive_desc)],
             PRE_MSG_OR_Q: [CommandHandler("undo", handle_undo), CommandHandler("done", finish_quiz_creation), MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pre_msg)],
             QUESTIONS: [CommandHandler("undo", handle_undo), CommandHandler("done", finish_quiz_creation), MessageHandler(filters.POLL, receive_poll)],
-            TIMER: [CallbackQueryHandler(save_timer_and_finalize, pattern="^time_")]
+            TIMER: [
+                CallbackQueryHandler(save_timer_and_finalize, pattern="^time_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_timer_text)
+            ]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
